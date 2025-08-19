@@ -217,10 +217,6 @@ pytest --cov=llm_optimizer tests/
 4. Add tests
 5. Submit a pull request
 
-## 📄 License
-
-MIT License - see LICENSE file for details
-
 ## 🙏 Acknowledgments
 
 - MLIR/LLVM community for the optimization framework
@@ -228,12 +224,3 @@ MIT License - see LICENSE file for details
 - HuggingFace for transformer models
 - AWS for SageMaker platform
 
-## 📞 Support
-
-- Issues: GitHub Issues
-- Discussions: GitHub Discussions
-- Email: support@llm-optimizer.com
-
----
-
-**Built with ❤️ for the AI/ML community**
