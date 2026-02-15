@@ -2,7 +2,7 @@
 
 A high-performance MLIR-based runtime optimizer for quantized transformer LLMs, designed for low-latency edge deployment on NVIDIA GPUs.
 
-## 🚀 Features
+##  Features
 
 - **Custom MLIR Passes**: Transformer-specific optimizations targeting edge devices
 - **Quantization Pipeline**: 75% model size reduction with minimal accuracy loss
@@ -11,13 +11,13 @@ A high-performance MLIR-based runtime optimizer for quantized transformer LLMs, 
 - **Comprehensive Benchmarking**: Performance validation suite
 - **HuggingFace Integration**: Seamless model compatibility
 
-## 📊 Performance
+##  Performance
 
 - **48% latency reduction** on NVIDIA GPUs using TensorRT + ONNX rewriting
 - **75% model size reduction** through quantization-aware training
 - **Edge-optimized** for low-latency inference
 
-## 🏗️ Architecture
+##  Architecture
 
 ```
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
@@ -32,7 +32,7 @@ A high-performance MLIR-based runtime optimizer for quantized transformer LLMs, 
 └─────────────────┘    └─────────────────┘    └─────────────────┘
 ```
 
-## 🛠️ Installation
+##  Installation
 
 ### Prerequisites
 
@@ -59,7 +59,7 @@ pip install -r requirements.txt
 ./scripts/build_mlir_passes.sh
 ```
 
-## 🚀 Quick Start
+##  Quick Start
 
 ### Basic Usage
 
@@ -110,7 +110,7 @@ optimized_mlir = mlir_optimizer.apply_passes(
 )
 ```
 
-## 📁 Project Structure
+##  Project Structure
 
 ```
 llm-runtime-optimizer/
@@ -129,7 +129,7 @@ llm-runtime-optimizer/
 └── configs/                    # Configuration files
 ```
 
-## 🔧 Configuration
+##  Configuration
 
 ### Optimization Levels
 
@@ -143,7 +143,7 @@ llm-runtime-optimizer/
 - **CPU**: x86/ARM CPU optimization
 - **Edge**: Mobile/embedded device optimization
 
-## 📈 Benchmarking
+##  Benchmarking
 
 Run comprehensive performance benchmarks:
 
@@ -158,7 +158,7 @@ python -m benchmarks.latency_benchmark --model gpt2 --batch_size 32
 python -m benchmarks.generate_report
 ```
 
-## 🚀 Deployment
+##  Deployment
 
 ### AWS SageMaker
 
@@ -186,7 +186,7 @@ curl -X POST http://localhost:8000/optimize \
   -d '{"model_name": "gpt2", "optimization_level": "aggressive"}'
 ```
 
-## 🧪 Testing
+##  Testing
 
 ```bash
 # Run all tests
@@ -201,7 +201,7 @@ pytest tests/test_tensorrt.py
 pytest --cov=llm_optimizer tests/
 ```
 
-## 📊 Performance Results
+##  Performance Results
 
 | Model | Original Latency | Optimized Latency | Improvement |
 |-------|------------------|-------------------|-------------|
@@ -209,7 +209,7 @@ pytest --cov=llm_optimizer tests/
 | BERT (110M) | 38ms | 20ms | 47% |
 | T5 (220M) | 67ms | 35ms | 48% |
 
-## 🤝 Contributing
+##  Contributing
 
 1. Fork the repository
 2. Create a feature branch
@@ -217,7 +217,7 @@ pytest --cov=llm_optimizer tests/
 4. Add tests
 5. Submit a pull request
 
-## 🙏 Acknowledgments
+##  Acknowledgments
 
 - MLIR/LLVM community for the optimization framework
 - NVIDIA for TensorRT and CUDA
