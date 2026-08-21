@@ -1,226 +1,149 @@
-# LLM-Aware Runtime Optimizer
+# LLM Runtime Optimizer
 
-A high-performance MLIR-based runtime optimizer for quantized transformer LLMs, designed for low-latency edge deployment on NVIDIA GPUs.
+Quantize a PyTorch transformer, then measure whether it actually got faster.
 
-##  Features
+The point of this tool is the second half. Quantization is easy to apply and easy
+to report as a win, because the size drop is real and immediate. Whether latency
+improved is a separate question, and on a lot of hardware the answer is no. This
+prints both numbers and tells you when the latency difference is inside the
+run-to-run noise.
 
-- **Custom MLIR Passes**: Transformer-specific optimizations targeting edge devices
-- **Quantization Pipeline**: 75% model size reduction with minimal accuracy loss
-- **ONNX Rewriting Engine**: TensorRT compatibility and optimization
-- **AWS SageMaker Integration**: Auto-scaling deployment endpoints
-- **Comprehensive Benchmarking**: Performance validation suite
-- **HuggingFace Integration**: Seamless model compatibility
+[![CI](https://github.com/krrishapatel/LLM-Aware-Runtime-Optimizer/actions/workflows/ci.yml/badge.svg)](https://github.com/krrishapatel/LLM-Aware-Runtime-Optimizer/actions/workflows/ci.yml)
 
-##  Performance
+## What it does
 
-- **48% latency reduction** on NVIDIA GPUs using TensorRT + ONNX rewriting
-- **75% model size reduction** through quantization-aware training
-- **Edge-optimized** for low-latency inference
+- Counts a model's layers and reports how much of it is quantizable
+- Applies `torch.ao.quantization` dynamic int8, static int8, or fp16
+- Measures size from the serialized `state_dict`, not from `parameters()`
+- Times both models with warmup and device sync, and reports a significance flag
+- Exports to ONNX and reports what onnxruntime's graph optimizer changed
+- Writes a SageMaker deployment package and prints the AWS CLI commands to use it
 
-##  Architecture
+## What it does not do
 
-```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   HuggingFace  │    │   MLIR Passes   │    │   TensorRT      │
-│   Transformers │───▶│   Optimization  │───▶│   Runtime       │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-         │                       │                       │
-         ▼                       ▼                       ▼
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│  Quantization  │    │   ONNX Model    │    │   Edge Device   │
-│     Pipeline    │    │   Rewriting     │    │   Deployment    │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-```
+No MLIR. No TensorRT. No custom compiler passes. Nothing is deployed to AWS for
+you. Earlier versions of this repo had modules named after those things which did
+not call them, and a README quoting a 48% latency reduction that came from
+hardcoded per-layer constants rather than a measurement. Those modules are gone.
+See [the note below](#what-changed-in-020).
 
-##  Installation
-
-### Prerequisites
-
-- Python 3.8+
-- CUDA 11.0+
-- TensorRT 8.0+
-- MLIR/LLVM 15.0+
-- PyTorch 1.12+
-
-### Setup
+## Install
 
 ```bash
-# Clone the repository
-git clone <repository-url>
-cd llm-runtime-optimizer
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Install MLIR dependencies
-./scripts/install_mlir.sh
-
-# Build custom MLIR passes
-./scripts/build_mlir_passes.sh
+pip install -e .
+pip install -r requirements-dev.txt   # tests, onnx, onnxruntime
 ```
 
-##  Quick Start
+Python 3.9+ and PyTorch 2.0+. No CUDA required.
 
-### Basic Usage
+## Use
+
+```bash
+llm-optimize info
+llm-optimize analyze distilbert-base-uncased
+llm-optimize optimize distilbert-base-uncased --seq-len 32 --runs 100
+```
 
 ```python
 from llm_optimizer import LLMOptimizer
-from llm_optimizer.quantization import QuantizationPipeline
+import torch
 
-# Initialize optimizer
-optimizer = LLMOptimizer(
-    model_name="microsoft/DialoGPT-medium",
-    target_device="cuda",
-    optimization_level="aggressive"
-)
+opt = LLMOptimizer(model_name="distilbert-base-uncased", quantization="dynamic")
+opt.load_model()
+opt.optimize()
 
-# Load and optimize model
-optimized_model = optimizer.optimize()
+print(opt.quantization_report["size_reduction"])
 
-# Run inference
-output = optimized_model.generate("Hello, how are you?")
+result = opt.benchmark(torch.randint(0, 30522, (1, 32)), num_runs=100)
+print(result["speedup"], result["significant"])
 ```
 
-### Quantization Pipeline
+`significant` is False when the median gap is smaller than the two standard
+deviations added together. When it is False, the speedup number means nothing.
 
-```python
-# Initialize quantization pipeline
-quantizer = QuantizationPipeline(
-    model=model,
-    calibration_data=calibration_data,
-    target_size_reduction=0.75
-)
+## Measured results
 
-# Quantize model
-quantized_model = quantizer.quantize()
-```
+`distilbert-base-uncased`, dynamic int8, batch 1. Apple Silicon (arm64), torch
+2.13.0, Python 3.12.13, qnnpack backend. 100 timed runs after 5 warmup runs.
 
-### MLIR Optimization
+| Measurement | Before | After | Change |
+|---|---|---|---|
+| Serialized size | 253.19 MB | 131.71 MB | **48.0% smaller** |
+| Median latency, 32 tokens | 10.87 ms | 9.79 ms | 1.11x, not significant |
+| Median latency, 128 tokens | 20.20 ms | 30.23 ms | **0.67x, significantly slower** |
 
-```python
-from llm_optimizer.mlir import MLIROptimizer
+36 of 91 modules were converted, covering 64% of the parameters.
 
-# Create MLIR optimizer
-mlir_optimizer = MLIROptimizer()
+Read the third row. Dynamic int8 on this model on this machine is a real
+slowdown at 128 tokens, reproducible across runs, and well outside the noise. At
+32 tokens the apparent 1.11x speedup is inside the noise and the tool says so.
+The size reduction is the only reliable win here.
 
-# Apply custom passes
-optimized_mlir = mlir_optimizer.apply_passes(
-    model_mlir,
-    passes=["transformer-fusion", "attention-optimization", "memory-layout"]
-)
-```
+That result is backend specific. qnnpack is what's available on Apple Silicon;
+fbgemm on x86 generally does better on int8 matmul. The tool reports which
+engine it used so you can tell the two situations apart. Run it on your own
+hardware rather than trusting this table.
 
-##  Project Structure
+Two more measured results worth knowing, both covered by tests:
 
-```
-llm-runtime-optimizer/
-├── src/
-│   ├── llm_optimizer/           # Core optimization engine
-│   ├── mlir_passes/            # Custom MLIR passes
-│   ├── quantization/            # Quantization pipeline
-│   ├── onnx_rewriter/          # ONNX model rewriting
-│   ├── tensorrt_integration/   # TensorRT runtime
-│   └── deployment/             # AWS SageMaker integration
-├── tests/                      # Comprehensive test suite
-├── benchmarks/                 # Performance benchmarking
-├── examples/                   # Usage examples
-├── scripts/                    # Build and installation scripts
-├── docs/                       # Documentation
-└── configs/                    # Configuration files
-```
+- **int8 can make a small model bigger.** Static int8 on a 544-parameter MLP
+  grows it 6.6%; dynamic int8 on a 144-parameter one grows it 30%. Per-tensor
+  scales, zero points and packing metadata cost more than the weights save. The
+  familiar ~75% figure only arrives above roughly 100k parameters.
+- **fp16 is not exactly 50%.** It measures 24% on a 4.5KB model, 46.7% on a 35KB
+  one, and 49.8% at 500KB, because `torch.save`'s zip container is a fixed ~1KB
+  that does not halve along with the weights.
 
-##  Configuration
+Which is the general point: the size reduction depends on the model, and a
+number written into a README ahead of time is a guess.
 
-### Optimization Levels
-
-- **Conservative**: Minimal optimizations, maximum compatibility
-- **Balanced**: Balanced performance and compatibility
-- **Aggressive**: Maximum performance, may require model-specific tuning
-
-### Target Devices
-
-- **CUDA**: NVIDIA GPU optimization
-- **CPU**: x86/ARM CPU optimization
-- **Edge**: Mobile/embedded device optimization
-
-##  Benchmarking
-
-Run comprehensive performance benchmarks:
+## Tests
 
 ```bash
-# Run all benchmarks
-python -m benchmarks.run_all
-
-# Run specific benchmark
-python -m benchmarks.latency_benchmark --model gpt2 --batch_size 32
-
-# Generate performance report
-python -m benchmarks.generate_report
+python -m pytest
 ```
 
-##  Deployment
+130 tests. They encode the measurements above, including the cases where
+quantization loses. Three bugs in this rewrite were caught by these tests rather
+than assumed away: a quantized model reporting 0 bytes because
+`DynamicQuantizedLinear` keeps weights in `_packed_params`, a module count that
+double-counted those same `_packed_params` children, and an assumption that graph
+optimization always reduces the ONNX node count.
 
-### AWS SageMaker
+That last one is worth a note. On a small transformer, onnxruntime at level
+`extended` takes the graph from 25 nodes to 28 while doing genuine fusion: it
+folds nine Adds and nine MatMuls into seven Gemms, then inserts fourteen Reshapes
+to give those Gemms 2D inputs. Node count is not a quality metric. Read
+`ops_added` and `ops_removed` instead.
 
-```python
-from llm_optimizer.deployment import SageMakerDeployer
+## SageMaker packaging
 
-deployer = SageMakerDeployer(
-    model=optimized_model,
-    instance_type="ml.g4dn.xlarge",
-    auto_scaling=True
-)
+`SageMakerPackageBuilder` traces the model to TorchScript and writes the files
+the SageMaker PyTorch container expects: `model.pt`, `config.json`, an
+`inference.py` with the four handler functions, `requirements.txt`, `Dockerfile`,
+and a `model.tar.gz`.
 
-endpoint = deployer.deploy()
-```
+It does not call AWS. There is no `deploy()` method, no boto3 dependency, and no
+credentials are read. `next_steps()` returns the `aws s3 cp` and
+`aws sagemaker create-*` commands as strings for you to run yourself, including
+the `delete-endpoint` reminder, since a forgotten `ml.g4dn.xlarge` endpoint is
+$537 a month at $0.736 an hour. `cost_estimate()` prices the instance from a table dated
+2026-08-17.
 
-### Local Deployment
+## What changed in 0.2.0
 
-```bash
-# Start optimization server
-python -m llm_optimizer.server --port 8000
+0.1.0 was 3032 lines that mostly did not work. `optimize()` was
+`self.optimized_model = self.model`. `mlir.py` set `op["optimized"] = True` on a
+dict of operation names. `tensorrt_integration.py` returned
+`{"type": "tensorrt_engine", ...}` and benchmarked that dict.
+`onnx_rewriter.py` had six passes whose entire body was `return onnx_model`.
+`deployment.py` imported no boto3, logged fake AWS successes, wrote a file
+called `model.placeholder`, and generated a `predict_fn` returning
+`torch.randn(1, n, 50257)` decoded as text. `setup.py` could not install.
+`requirements.txt` listed PyPI packages that do not exist.
 
-# Client usage
-curl -X POST http://localhost:8000/optimize \
-  -H "Content-Type: application/json" \
-  -d '{"model_name": "gpt2", "optimization_level": "aggressive"}'
-```
+All of that was deleted. What's here now is smaller and does what it says.
 
-##  Testing
+## License
 
-```bash
-# Run all tests
-pytest tests/
-
-# Run specific test category
-pytest tests/test_mlir_passes.py
-pytest tests/test_quantization.py
-pytest tests/test_tensorrt.py
-
-# Run with coverage
-pytest --cov=llm_optimizer tests/
-```
-
-##  Performance Results
-
-| Model | Original Latency | Optimized Latency | Improvement |
-|-------|------------------|-------------------|-------------|
-| GPT-2 (117M) | 45ms | 23ms | 48% |
-| BERT (110M) | 38ms | 20ms | 47% |
-| T5 (220M) | 67ms | 35ms | 48% |
-
-##  Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests
-5. Submit a pull request
-
-##  Acknowledgments
-
-- MLIR/LLVM community for the optimization framework
-- NVIDIA for TensorRT and CUDA
-- HuggingFace for transformer models
-- AWS for SageMaker platform
-
+MIT

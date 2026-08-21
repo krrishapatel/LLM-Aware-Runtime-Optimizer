@@ -1,43 +1,31 @@
-"""
-LLM-Aware Runtime Optimizer
+"""Quantize a PyTorch transformer, then measure whether it got faster.
+
+Imports are plain and unguarded. The previous version wrapped each one in
+try/except ImportError and set a MODULE_AVAILABLE flag, which hid two real
+faults: `deployment` exported SageMakerDeployer while __init__ asked for
+DeploymentManager, and `quantization` raised AttributeError on torch.qint16.
+Both showed up as a flag quietly set to False.
+
+`onnx_export` is not imported here, because onnx is an optional dependency.
+Import it directly when you need it.
 """
 
-__version__ = "0.1.0"
-__author__ = "LLM Optimizer Team"
-__email__ = "support@llm-optimizer.com"
+__version__ = "0.2.0"
 
-# Import core modules
+from . import analysis, benchmark
 from .core import LLMOptimizer
-from .utils import OptimizationConfig, PerformanceMetrics, setup_logging
-
-# Import other modules only if they're available
-try:
-    from .quantization import QuantizationPipeline
-    QUANTIZATION_AVAILABLE = True
-except ImportError:
-    QuantizationPipeline = None
-    QUANTIZATION_AVAILABLE = False
-
-try:
-    from .deployment import DeploymentManager
-    DEPLOYMENT_AVAILABLE = True
-except ImportError:
-    DeploymentManager = None
-    DEPLOYMENT_AVAILABLE = False
-
-# MLIR, ONNX, TensorRT are not directly imported here due to macOS compatibility
-MLIR_AVAILABLE = False
-ONNX_AVAILABLE = False
-TENSORRT_AVAILABLE = False
+from .packaging import SageMakerPackageBuilder
+from .quantization import QuantizationPipeline
+from .utils import OptimizationConfig, get_system_info, setup_logging, validate_environment
 
 __all__ = [
     "LLMOptimizer",
     "OptimizationConfig",
-    "PerformanceMetrics",
+    "QuantizationPipeline",
+    "SageMakerPackageBuilder",
+    "analysis",
+    "benchmark",
+    "get_system_info",
     "setup_logging",
+    "validate_environment",
 ]
-
-if QUANTIZATION_AVAILABLE:
-    __all__.append("QuantizationPipeline")
-if DEPLOYMENT_AVAILABLE:
-    __all__.append("DeploymentManager")

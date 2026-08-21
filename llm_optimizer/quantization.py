@@ -1,351 +1,225 @@
-"""
-Quantization pipeline for LLM models to reduce model size and improve inference performance.
+"""Quantization built on torch.ao.quantization.
+
+The int8 conversion here is real PyTorch quantization, and `quantize` reports the
+size it measured rather than the size it was asked for. The version this replaces
+could not run at all: it referenced `torch.qint16`, which does not exist, so
+constructing the pipeline raised AttributeError before any model was touched.
 """
 
 import logging
-from typing import Dict, Any, Optional, Union, List, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
+
 import torch
 import torch.nn as nn
-from torch.quantization import quantize_dynamic, quantize_fx
-from transformers import PreTrainedModel
+import torch.ao.quantization as tq
+
+from .analysis import QUANTIZABLE_TYPES, analyze, serialized_size_bytes
 
 logger = logging.getLogger(__name__)
 
+QUANTIZATION_TYPES = ("dynamic", "static", "fp16")
+
+
+def default_qengine() -> str:
+    """Pick a quantized backend that this machine actually has.
+
+    The previous code hardcoded 'fbgemm', which is x86 only. On Apple Silicon
+    the supported engine is qnnpack, so every static path failed there.
+    """
+    supported = list(torch.backends.quantized.supported_engines)
+    for engine in ("fbgemm", "qnnpack"):
+        if engine in supported:
+            return engine
+    raise RuntimeError(
+        f"No usable quantized engine. torch reports: {supported or 'none'}"
+    )
+
 
 class QuantizationPipeline:
+    """Quantize a model and report what changed.
+
+    Three modes:
+
+    - `dynamic`: int8 weights on Linear and RNN layers, activations quantized at
+      run time. Works on any model with no calibration data. CPU only.
+    - `static`: int8 weights and activations, calibrated on real batches. Needs
+      a model built with QuantStub/DeQuantStub around the quantized region;
+      most HuggingFace models are not, so this raises rather than returning a
+      model that produces garbage.
+    - `fp16`: half precision for everything. Halves the size, and is fast on
+      CUDA but usually slower than fp32 on CPU.
     """
-    Advanced quantization pipeline for transformer models.
-    
-    Supports:
-    - Dynamic quantization (INT8)
-    - Static quantization (INT8/INT16)
-    - Mixed precision quantization
-    - Quantization-aware training (QAT)
-    """
-    
+
     def __init__(
         self,
         quantization_type: str = "dynamic",
-        target_precision: str = "int8",
-        calibration_data: Optional[Any] = None,
-        enable_qat: bool = False
+        calibration_data: Optional[Iterable[Any]] = None,
+        qengine: Optional[str] = None,
     ):
-        """
-        Initialize quantization pipeline.
-        
-        Args:
-            quantization_type: Type of quantization ("dynamic", "static", "mixed")
-            target_precision: Target precision ("int8", "int16", "mixed")
-            calibration_data: Data for calibration (required for static quantization)
-            enable_qat: Enable quantization-aware training
-        """
+        if quantization_type not in QUANTIZATION_TYPES:
+            raise ValueError(
+                f"Unsupported quantization type {quantization_type!r}. "
+                f"Choose one of {', '.join(QUANTIZATION_TYPES)}."
+            )
+        if quantization_type == "static" and calibration_data is None:
+            # Checked here, not partway through quantize(), so the failure lands
+            # before a large model has been loaded.
+            raise ValueError(
+                "Static quantization needs calibration_data: an iterable of "
+                "batches to run through the model."
+            )
+
         self.quantization_type = quantization_type
-        self.target_precision = target_precision
         self.calibration_data = calibration_data
-        self.enable_qat = enable_qat
-        
-        # Quantization configuration
-        self.quantization_config = self._get_quantization_config()
-        
-        logger.info(f"Initialized {quantization_type} quantization pipeline with {target_precision} precision")
-    
-    def _get_quantization_config(self) -> Dict[str, Any]:
-        """Get quantization configuration based on type and precision."""
-        config = {
-            "dynamic": {
-                "int8": {"dtype": torch.qint8, "qscheme": torch.per_tensor_affine},
-                "int16": {"dtype": torch.qint16, "qscheme": torch.per_tensor_affine}
-            },
-            "static": {
-                "int8": {"dtype": torch.qint8, "qscheme": torch.per_tensor_symmetric},
-                "int16": {"dtype": torch.qint16, "qscheme": torch.per_tensor_symmetric}
-            },
-            "mixed": {
-                "mixed": {"dtype": torch.float16, "qscheme": torch.per_tensor_affine}
-            }
-        }
-        
-        return config.get(self.quantization_type, {}).get(self.target_precision, {})
-    
-    def quantize(
-        self,
-        model: PreTrainedModel,
-        target_size_reduction: float = 0.75,
-        **kwargs
-    ) -> PreTrainedModel:
-        """
-        Quantize the model according to the specified configuration.
-        
-        Args:
-            model: PyTorch model to quantize
-            target_size_reduction: Target size reduction (0.0 to 1.0)
-            **kwargs: Additional quantization parameters
-            
-        Returns:
-            Quantized model
-        """
-        logger.info(f"Starting {self.quantization_type} quantization...")
-        
-        # Prepare model for quantization
-        prepared_model = self._prepare_model_for_quantization(model)
-        
-        # Apply quantization based on type
-        if self.quantization_type == "dynamic":
-            quantized_model = self._apply_dynamic_quantization(prepared_model)
-        elif self.quantization_type == "static":
-            quantized_model = self._apply_static_quantization(prepared_model)
-        elif self.quantization_type == "mixed":
-            quantized_model = self._apply_mixed_precision(prepared_model)
-        else:
-            raise ValueError(f"Unsupported quantization type: {self.quantization_type}")
-        
-        # Post-quantization optimization
-        optimized_model = self._post_quantization_optimization(quantized_model)
-        
-        # Validate quantization results
-        self._validate_quantization(model, optimized_model, target_size_reduction)
-        
-        logger.info("Quantization completed successfully!")
-        return optimized_model
-    
-    def _prepare_model_for_quantization(self, model: PreTrainedModel) -> PreTrainedModel:
-        """Prepare model for quantization by setting appropriate modes."""
-        model.eval()
-        
-        # Set quantization mode
-        if hasattr(model, 'config'):
-            model.config.use_cache = False
-        
-        # Prepare for dynamic quantization
-        if self.quantization_type == "dynamic":
-            # Mark layers for quantization
-            for name, module in model.named_modules():
-                if isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d)):
-                    module.qconfig = torch.quantization.get_default_qconfig('fbgemm')
-        
-        return model
-    
-    def _apply_dynamic_quantization(self, model: PreTrainedModel) -> PreTrainedModel:
-        """Apply dynamic quantization to the model."""
-        logger.info("Applying dynamic quantization...")
-        
-        # Quantize linear layers
-        quantized_model = quantize_dynamic(
-            model,
-            {nn.Linear, nn.Conv1d, nn.Conv2d},
-            dtype=torch.qint8
+        self.qengine = qengine or default_qengine()
+        self.last_report: Dict[str, Any] = {}
+
+        logger.info(
+            "Quantization pipeline ready: %s, engine %s",
+            quantization_type,
+            self.qengine,
         )
-        
-        return quantized_model
-    
-    def _apply_static_quantization(self, model: PreTrainedModel) -> PreTrainedModel:
-        """Apply static quantization to the model."""
-        if self.calibration_data is None:
-            raise ValueError("Calibration data required for static quantization")
-        
-        logger.info("Applying static quantization...")
-        
-        # Prepare for static quantization
+
+    def quantize(self, model: nn.Module) -> Tuple[nn.Module, Dict[str, Any]]:
+        """Quantize the model and return it with a measured report.
+
+        Returns a tuple, because the size reduction is the point and hiding it
+        behind a separate accessor is how the old code got away with logging a
+        target it never hit.
+        """
+        before = analyze(model)
+
+        if self.quantization_type in ("dynamic", "static"):
+            # torch.backends.quantized.engine defaults to 'none' on some builds,
+            # and the int8 kernels then fail with "Didn't find engine for
+            # operation quantized::linear_prepack NoQEngine" partway through the
+            # conversion. Set it before touching the model.
+            torch.backends.quantized.engine = self.qengine
+
+        if self.quantization_type == "dynamic":
+            quantized = self._dynamic(model)
+        elif self.quantization_type == "static":
+            quantized = self._static(model)
+        else:
+            quantized = self._fp16(model)
+
+        # Measured on the serialized state_dict, not on parameters(). A
+        # dynamically quantized module keeps its weights in _packed_params, so
+        # summing parameters() gives 0 bytes and a reported 100% reduction.
+        after_size = serialized_size_bytes(quantized)
+        before_size = before["serialized_size_bytes"]
+        report = {
+            "quantization_type": self.quantization_type,
+            "qengine": self.qengine,
+            "size_bytes_before": before_size,
+            "size_bytes_after": after_size,
+            "size_reduction": (
+                (before_size - after_size) / before_size if before_size else 0.0
+            ),
+            "quantizable_parameter_fraction": before["quantizable_parameter_fraction"],
+            "converted_modules": self._count_quantized_modules(quantized),
+        }
+        self.last_report = report
+
+        logger.info(
+            "Measured size reduction: %.1f%% (%d -> %d bytes)",
+            report["size_reduction"] * 100,
+            before_size,
+            after_size,
+        )
+        return quantized, report
+
+    def _dynamic(self, model: nn.Module) -> nn.Module:
+        """int8 dynamic quantization. Returns a new module, does not mutate."""
         model.eval()
-        
-        # Calibrate the model
-        calibrated_model = self._calibrate_model(model)
-        
-        # Convert to quantized model
-        quantized_model = torch.quantization.convert(calibrated_model)
-        
-        return quantized_model
-    
-    def _apply_mixed_precision(self, model: PreTrainedModel) -> PreTrainedModel:
-        """Apply mixed precision quantization."""
-        logger.info("Applying mixed precision quantization...")
-        
-        # Convert to half precision
-        model = model.half()
-        
-        # Apply selective quantization to specific layers
-        for name, module in model.named_modules():
-            if isinstance(module, nn.Linear) and "attention" in name.lower():
-                # Keep attention layers in half precision for better accuracy
-                continue
-            elif isinstance(module, nn.Linear):
-                # Quantize other linear layers
-                module = torch.quantization.quantize_dynamic(
-                    module, {nn.Linear}, dtype=torch.qint8
-                )
-        
-        return model
-    
-    def _calibrate_model(self, model: PreTrainedModel) -> PreTrainedModel:
-        """Calibrate model for static quantization."""
-        logger.info("Calibrating model...")
-        
-        # Set calibration mode
+        return tq.quantize_dynamic(model, set(QUANTIZABLE_TYPES), dtype=torch.qint8)
+
+    def _static(self, model: nn.Module) -> nn.Module:
+        """int8 static quantization with calibration."""
+        if not any(isinstance(m, tq.QuantStub) for m in model.modules()):
+            raise ValueError(
+                "Static quantization needs the model to wrap its quantized "
+                "region in QuantStub/DeQuantStub. Use quantization_type="
+                "'dynamic' for an unmodified model."
+            )
+
         model.eval()
-        
-        # Run calibration data through the model
+        model.qconfig = tq.get_default_qconfig(self.qengine)
+
+        prepared = tq.prepare(model, inplace=False)
+        batches = 0
         with torch.no_grad():
             for batch in self.calibration_data:
                 if isinstance(batch, dict):
-                    _ = model(**batch)
+                    prepared(**batch)
                 elif isinstance(batch, (tuple, list)):
-                    _ = model(*batch)
+                    prepared(*batch)
                 else:
-                    _ = model(batch)
-        
-        return model
-    
-    def _post_quantization_optimization(self, model: PreTrainedModel) -> PreTrainedModel:
-        """Apply post-quantization optimizations."""
-        logger.info("Applying post-quantization optimizations...")
-        
-        # Fuse operations where possible
-        if hasattr(torch.quantization, 'fuse_modules'):
-            model = torch.quantization.fuse_modules(model, ['conv', 'bn', 'relu'])
-        
-        # Optimize for inference
-        model.eval()
-        
-        # Enable optimizations
-        if hasattr(torch, 'jit'):
-            try:
-                model = torch.jit.optimize_for_inference(torch.jit.script(model))
-            except Exception as e:
-                logger.warning(f"JIT optimization failed: {e}")
-        
-        return model
-    
-    def _validate_quantization(
-        self,
-        original_model: PreTrainedModel,
-        quantized_model: PreTrainedModel,
-        target_size_reduction: float
-    ):
-        """Validate quantization results."""
-        logger.info("Validating quantization results...")
-        
-        # Check model size reduction
-        original_size = self._get_model_size(original_model)
-        quantized_size = self._get_model_size(quantized_model)
-        actual_reduction = (original_size - quantized_size) / original_size
-        
-        logger.info(f"Model size reduction: {actual_reduction:.2%} (target: {target_size_reduction:.2%})")
-        
-        if actual_reduction < target_size_reduction * 0.8:  # Allow 20% tolerance
-            logger.warning(f"Size reduction target not met: {actual_reduction:.2%} < {target_size_reduction:.2%}")
-        
-        # Check parameter count
-        original_params = sum(p.numel() for p in original_model.parameters())
-        quantized_params = sum(p.numel() for p in quantized_model.parameters())
-        
-        logger.info(f"Parameter count: {original_params:,} -> {quantized_params:,}")
-        
-        # Validate model functionality
-        self._validate_model_functionality(quantized_model)
-    
-    def _get_model_size(self, model: PreTrainedModel) -> int:
-        """Get approximate model size in bytes."""
-        param_size = 0
-        buffer_size = 0
-        
-        for param in model.parameters():
-            param_size += param.nelement() * param.element_size()
-        
-        for buffer in model.buffers():
-            buffer_size += buffer.nelement() * buffer.element_size()
-        
-        return param_size + buffer_size
-    
-    def _validate_model_functionality(self, model: PreTrainedModel):
-        """Validate that the quantized model still functions correctly."""
-        logger.info("Validating model functionality...")
-        
-        try:
-            # Test with dummy input
-            if hasattr(model, 'config'):
-                hidden_size = getattr(model.config, 'hidden_size', 768)
-                dummy_input = torch.randn(1, 10, hidden_size)
-                
-                with torch.no_grad():
-                    if hasattr(model, 'forward'):
-                        output = model(dummy_input)
-                        logger.info("Model forward pass successful")
-                    else:
-                        logger.info("Model forward pass validation skipped (no forward method)")
-            
-            logger.info("Model functionality validation passed")
-            
-        except Exception as e:
-            logger.error(f"Model functionality validation failed: {e}")
-            raise
-    
-    def get_quantization_stats(self) -> Dict[str, Any]:
-        """Get quantization statistics and metrics."""
-        return {
-            "quantization_type": self.quantization_type,
-            "target_precision": self.target_precision,
-            "enable_qat": self.enable_qat,
-            "config": self.quantization_config
-        }
-    
-    def create_quantization_plan(
-        self,
-        model: PreTrainedModel
-    ) -> Dict[str, Any]:
+                    prepared(batch)
+                batches += 1
+
+        if batches == 0:
+            # Converting an uncalibrated model gives observers with no observed
+            # range, which quantizes every activation to zero. Better to stop.
+            raise ValueError(
+                "calibration_data yielded no batches, so the observers saw no "
+                "activations. Converting now would produce a model that "
+                "outputs zeros."
+            )
+
+        logger.info("Calibrated on %d batch(es)", batches)
+        return tq.convert(prepared, inplace=False)
+
+    def _fp16(self, model: nn.Module) -> nn.Module:
+        """Half precision.
+
+        `.half()` mutates in place and returns self, so this copies first. The
+        old implementation also ran a loop that assigned the result of
+        quantize_dynamic to a local name and dropped it, which did nothing.
         """
-        Create a detailed quantization plan for the model.
-        
-        Args:
-            model: Model to analyze
-            
-        Returns:
-            Quantization plan with layer-by-layer details
+        import copy
+
+        return copy.deepcopy(model).eval().half()
+
+    @staticmethod
+    def _count_quantized_modules(model: nn.Module) -> int:
+        """How many layers came out as a quantized type.
+
+        Checks the class's module path for 'quantized' rather than listing every
+        quantized class, because the set differs between the dynamic, static and
+        fx paths.
+
+        Skips `_packed_params`, which is a child module of each quantized Linear
+        and is itself a quantized type. Counting it doubled the total, so two
+        quantized Linear layers reported as four.
         """
-        plan = {
-            "model_info": {
-                "total_layers": 0,
-                "quantizable_layers": 0,
-                "attention_layers": 0,
-                "linear_layers": 0
-            },
-            "layer_analysis": [],
-            "recommendations": []
-        }
-        
+        return sum(
+            1
+            for name, module in model.named_modules()
+            if name and not name.endswith("_packed_params")
+            and "quantized" in type(module).__module__
+        )
+
+    def plan(self, model: nn.Module) -> Dict[str, Any]:
+        """Per-layer view of what quantization would touch."""
+        report = analyze(model)
+        layers = []
         for name, module in model.named_modules():
-            if isinstance(module, nn.Module):
-                plan["model_info"]["total_layers"] += 1
-                
-                layer_info = {
+            if name == "":
+                continue
+            quantizable = isinstance(module, QUANTIZABLE_TYPES)
+            layers.append(
+                {
                     "name": name,
                     "type": type(module).__name__,
-                    "quantizable": False,
-                    "recommended_precision": "fp32"
+                    "parameters": sum(
+                        p.numel() for p in module.parameters(recurse=False)
+                    ),
+                    "quantizable": quantizable,
                 }
-                
-                if isinstance(module, nn.Linear):
-                    plan["model_info"]["linear_layers"] += 1
-                    layer_info["quantizable"] = True
-                    layer_info["recommended_precision"] = "int8"
-                    
-                    if "attention" in name.lower():
-                        plan["model_info"]["attention_layers"] += 1
-                        layer_info["recommended_precision"] = "fp16"  # Keep attention in higher precision
-                
-                plan["layer_analysis"].append(layer_info)
-                
-                if layer_info["quantizable"]:
-                    plan["model_info"]["quantizable_layers"] += 1
-        
-        # Generate recommendations
-        if plan["model_info"]["quantizable_layers"] > 0:
-            plan["recommendations"].append(
-                f"Quantize {plan['model_info']['quantizable_layers']} linear layers to int8"
             )
-        
-        if plan["model_info"]["attention_layers"] > 0:
-            plan["recommendations"].append(
-                f"Keep {plan['model_info']['attention_layers']} attention layers in fp16 for accuracy"
-            )
-        
-        return plan
+        return {
+            "summary": report,
+            "layers": layers,
+            "quantization_type": self.quantization_type,
+        }

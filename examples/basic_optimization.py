@@ -1,110 +1,63 @@
 #!/usr/bin/env python3
+"""Quantize a real model and print what it measured.
+
+Run:  python examples/basic_optimization.py
+
+Downloads distilbert-base-uncased on first run, about 250 MB.
 """
-Basic LLM optimization example.
-"""
 
-import logging
-import time
-import os
-from pathlib import Path
+import torch
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from llm_optimizer import LLMOptimizer
 
-def detect_device():
-    """Detect the best available device for the current system."""
-    try:
-        import torch
-        
-        # Check if CUDA is available
-        if torch.cuda.is_available():
-            return "cuda"
-        
-        # Check if MPS (Metal Performance Shaders) is available for Apple Silicon
-        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            return "mps"
-        
-        # Fallback to CPU
-        return "cpu"
-        
-    except ImportError:
-        return "cpu"
+MODEL_NAME = "distilbert-base-uncased"
+SEQ_LEN = 32
+RUNS = 100
+
 
 def main():
-    """Main example function."""
-    logger.info("Starting LLM optimization example...")
-    
-    try:
-        # Detect the best available device
-        device = detect_device()
-        logger.info(f"Detected device: {device}")
-        
-        # Import the optimizer
-        from llm_optimizer import LLMOptimizer
-        
-        logger.info("Initializing LLM optimizer...")
-        
-        # Initialize optimizer with detected device
-        optimizer = LLMOptimizer(
-            model_name="gpt2",
-            target_device=device,
-            optimization_level="balanced"
-        )
-        
-        logger.info("Loading GPT-2 model...")
-        
-        # Load the model
-        optimizer.load_model()
-        
-        logger.info("Running optimization...")
-        
-        # Run optimization
-        start_time = time.time()
-        optimized_model = optimizer.optimize()
-        optimization_time = time.time() - start_time
-        
-        logger.info(f"Optimization completed in {optimization_time:.2f} seconds")
-        
-        # Get optimization report
-        report = optimizer.get_optimization_report()
-        
-        logger.info("Optimization Report:")
-        for key, value in report.items():
-            if key == "performance_metrics":
-                logger.info(f"  {key}:")
-                for metric_key, metric_value in value.items():
-                    if isinstance(metric_value, float):
-                        logger.info(f"    {metric_key}: {metric_value:.6f}")
-                    else:
-                        logger.info(f"    {metric_key}: {metric_value}")
-            else:
-                logger.info(f"  {key}: {value}")
-        
-        # Save the optimized model
-        output_path = "./optimized_gpt2_example"
-        logger.info(f"Saving optimized model to {output_path}...")
-        
-        saved_path = optimizer.save_optimized_model(output_path)
-        logger.info(f"Model saved to: {saved_path}")
-        
-        # Compare model sizes
-        if hasattr(optimizer, 'model') and hasattr(optimizer, 'optimized_model'):
-            original_size = sum(p.numel() for p in optimizer.model.parameters()) * 4 / (1024**2)
-            optimized_size = sum(p.numel() for p in optimizer.optimized_model.parameters()) * 4 / (1024**2)
-            
-            logger.info(f"Original model size: {original_size:.1f} MB")
-            logger.info(f"Optimized model size: {optimized_size:.1f} MB")
-            
-            if original_size > 0:
-                size_reduction = ((original_size - optimized_size) / original_size) * 100
-                logger.info(f"Size reduction: {size_reduction:.1f}%")
-        
-        logger.info("Example completed successfully!")
-        
-    except Exception as e:
-        logger.error(f"Example failed: {e}")
-        raise
+    # Dynamic int8 is CPU only, so target_device is cpu. Passing cuda here
+    # raises in the constructor rather than failing later inside forward().
+    optimizer = LLMOptimizer(
+        model_name=MODEL_NAME, quantization="dynamic", target_device="cpu"
+    )
+    optimizer.load_model()
+
+    counts = optimizer.analyze()["counts"]
+    print(f"{MODEL_NAME}")
+    print(f"  parameters:       {counts['total_parameters']:,}")
+    print(f"  quantizable:      {counts['quantizable_parameters']:,} "
+          f"({counts['quantizable_parameter_fraction']:.0%})")
+    for note in optimizer.analyze()["suggestions"]:
+        print(f"  - {note}")
+
+    optimizer.optimize()
+    report = optimizer.quantization_report
+    print("\nSize")
+    print(f"  engine:    {report['qengine']}")
+    print(f"  before:    {report['size_bytes_before'] / 1024**2:.2f} MB")
+    print(f"  after:     {report['size_bytes_after'] / 1024**2:.2f} MB")
+    print(f"  reduction: {report['size_reduction']:.1%}")
+
+    vocab_size = optimizer.model.config.vocab_size
+    example = torch.randint(0, vocab_size, (1, SEQ_LEN), dtype=torch.long)
+    result = optimizer.benchmark(example, num_runs=RUNS)
+
+    print(f"\nLatency, batch 1 x {SEQ_LEN} tokens, {RUNS} runs")
+    print(f"  original:  {result['baseline']['median_ms']:.2f} ms "
+          f"(stdev {result['baseline']['stdev_ms']:.2f})")
+    print(f"  quantized: {result['candidate']['median_ms']:.2f} ms "
+          f"(stdev {result['candidate']['stdev_ms']:.2f})")
+    print(f"  speedup:   {result['speedup']:.2f}x")
+
+    # The part that matters. A speedup number with significant=False is noise,
+    # and reporting it as a win is how a benchmark table becomes fiction.
+    if result["significant"]:
+        direction = "faster" if result["speedup"] > 1 else "SLOWER"
+        print(f"  the difference is real, and quantization made it {direction}")
+    else:
+        print("  the difference is inside the run-to-run noise: no measurable change")
+
 
 if __name__ == "__main__":
     main()

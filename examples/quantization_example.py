@@ -1,152 +1,125 @@
 #!/usr/bin/env python3
+"""Compare quantization modes on local models. No download, no network.
+
+Run:  python examples/quantization_example.py
+
+Shows the two results that are easy to get wrong:
+  1. int8 makes a small enough model bigger, not smaller.
+  2. fp16 is not exactly 50%, because torch.save's container does not halve.
 """
-Quantization example demonstrating the quantization pipeline.
 
-This example shows:
-1. Different quantization types (dynamic, static, mixed)
-2. Quantization planning and analysis
-3. Performance impact of quantization
-4. Model size reduction
-"""
+import torch
+import torch.nn as nn
+import torch.ao.quantization as tq
 
-import logging
-import time
-from pathlib import Path
+from llm_optimizer import QuantizationPipeline
+from llm_optimizer.analysis import serialized_size_bytes
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+
+class MLP(nn.Module):
+    """Two linear layers. `width` controls how much there is to quantize."""
+
+    def __init__(self, width=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(width, width), nn.ReLU(), nn.Linear(width, width)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class StaticMLP(nn.Module):
+    """The same thing wrapped in stubs, which static quantization requires."""
+
+    def __init__(self, width=64):
+        super().__init__()
+        self.quant = tq.QuantStub()
+        self.net = nn.Sequential(
+            nn.Linear(width, width), nn.ReLU(), nn.Linear(width, width)
+        )
+        self.dequant = tq.DeQuantStub()
+
+    def forward(self, x):
+        return self.dequant(self.net(self.quant(x)))
+
+
+def show(label, before, after):
+    change = 1 - after / before
+    word = "smaller" if change > 0 else "LARGER"
+    print(f"  {label:<28} {before:>8,} -> {after:>8,} bytes  "
+          f"({abs(change):.1%} {word})")
+
+
+def size_across_widths():
+    # Quantization stores a scale and a zero point per tensor plus packing
+    # metadata. On a small enough model that overhead is larger than the weights
+    # it saves, so the checkpoint grows. A fixed "75% size reduction" claim is
+    # false at this end of the range: the 75% only arrives above roughly 100k
+    # parameters. Where the crossover sits depends on the mode, so both are here.
+    print("Dynamic int8 by model width")
+    for width in (8, 16, 32, 256, 1024):
+        model = MLP(width)
+        before = serialized_size_bytes(model)
+        quantized, report = QuantizationPipeline("dynamic").quantize(model)
+        show(f"width {width}", before, report["size_bytes_after"])
+        assert quantized is not model
+
+    print("\nStatic int8 by model width")
+    for width in (16, 32, 64, 256):
+        model = StaticMLP(width)
+        before = serialized_size_bytes(model)
+        calibration = [torch.randn(4, width) for _ in range(3)]
+        _, report = QuantizationPipeline(
+            "static", calibration_data=calibration
+        ).quantize(model)
+        show(f"width {width}", before, report["size_bytes_after"])
+
+
+def modes_on_one_model():
+    width = 256
+    print(f"\nModes, width {width}")
+
+    model = MLP(width)
+    before = serialized_size_bytes(model)
+
+    _, dynamic = QuantizationPipeline("dynamic").quantize(model)
+    show("dynamic int8", before, dynamic["size_bytes_after"])
+    print(f"    engine {dynamic['qengine']}, "
+          f"{dynamic['converted_modules']} modules converted")
+
+    # fp16 halves every stored float but not the ~1KB zip container torch.save
+    # writes around them, so the reduction lands under 50%.
+    _, fp16 = QuantizationPipeline("fp16").quantize(MLP(width))
+    show("fp16", before, fp16["size_bytes_after"])
+
+    # Static needs real activations to set the observer ranges. Converting
+    # without them quantizes every activation to zero, so the pipeline raises
+    # instead of returning a broken model.
+    calibration = [torch.randn(8, width) for _ in range(10)]
+    _, static = QuantizationPipeline(
+        "static", calibration_data=calibration
+    ).quantize(StaticMLP(width))
+    show("static int8 (calibrated)", before, static["size_bytes_after"])
+
+
+def errors_are_raised_early():
+    print("\nRejected at construction, not halfway through")
+    for kwargs, why in (
+        ({"quantization_type": "int4"}, "int4 is not a mode"),
+        ({"quantization_type": "static"}, "static without calibration data"),
+    ):
+        try:
+            QuantizationPipeline(**kwargs)
+        except ValueError as e:
+            print(f"  {why}: {e}")
+
 
 def main():
-    """Run quantization example."""
-    logger.info("Starting quantization example...")
-    
-    try:
-        # Import required components
-        from llm_optimizer import QuantizationPipeline
-        from transformers import AutoModel, AutoTokenizer
-        
-        # Load a model for quantization
-        logger.info("Loading BERT model for quantization...")
-        model_name = "bert-base-uncased"
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModel.from_pretrained(model_name)
-        
-        logger.info(f"Model loaded: {model_name}")
-        logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-        
-        # Test different quantization approaches
-        quantization_types = ["dynamic", "static", "mixed"]
-        
-        for qtype in quantization_types:
-            logger.info(f"\n{'='*50}")
-            logger.info(f"Testing {qtype.upper()} quantization")
-            logger.info(f"{'='*50}")
-            
-            # Create quantization pipeline
-            quantizer = QuantizationPipeline(
-                quantization_type=qtype,
-                target_precision="int8",
-                enable_qat=False
-            )
-            
-            # Create quantization plan
-            logger.info("Creating quantization plan...")
-            plan = quantizer.create_quantization_plan(model)
-            
-            logger.info("Quantization Plan:")
-            logger.info(f"  Total Layers: {plan['model_info']['total_layers']}")
-            logger.info(f"  Quantizable Layers: {plan['model_info']['quantizable_layers']}")
-            logger.info(f"  Attention Layers: {plan['model_info']['attention_layers']}")
-            logger.info(f"  Linear Layers: {plan['model_info']['linear_layers']}")
-            
-            if plan['recommendations']:
-                logger.info("  Recommendations:")
-                for rec in plan['recommendations']:
-                    logger.info(f"    • {rec}")
-            
-            # Run quantization
-            logger.info(f"Running {qtype} quantization...")
-            start_time = time.time()
-            
-            try:
-                quantized_model = quantizer.quantize(
-                    model=model,
-                    target_size_reduction=0.75
-                )
-                
-                quantization_time = time.time() - start_time
-                logger.info(f"Quantization completed in {quantization_time:.2f} seconds")
-                
-                # Get quantization stats
-                stats = quantizer.get_quantization_stats()
-                logger.info(f"Quantization Stats:")
-                logger.info(f"  Type: {stats['quantization_type']}")
-                logger.info(f"  Precision: {stats['target_precision']}")
-                logger.info(f"  QAT Enabled: {stats['enable_qat']}")
-                
-                # Compare model sizes
-                original_size = get_model_size(model)
-                quantized_size = get_model_size(quantized_model)
-                size_reduction = ((original_size - quantized_size) / original_size) * 100
-                
-                logger.info(f"Model Size Comparison:")
-                logger.info(f"  Original: {original_size:.2f} MB")
-                logger.info(f"  Quantized: {quantized_size:.2f} MB")
-                logger.info(f"  Reduction: {size_reduction:.1f}%")
-                
-                # Test model functionality
-                logger.info("Testing quantized model functionality...")
-                test_model_functionality(quantized_model, tokenizer)
-                
-            except Exception as e:
-                logger.error(f"{qtype} quantization failed: {e}")
-                continue
-        
-        logger.info("\nQuantization example completed!")
-        
-    except ImportError as e:
-        logger.error(f"Failed to import required modules: {e}")
-        logger.info("Make sure you have installed the package: pip install -e .")
-    except Exception as e:
-        logger.error(f"Example failed: {e}")
-        raise
+    size_across_widths()
+    modes_on_one_model()
+    errors_are_raised_early()
 
-def get_model_size(model):
-    """Get approximate model size in MB."""
-    try:
-        if hasattr(model, 'parameters'):
-            total_params = sum(p.numel() for p in model.parameters())
-            # Assume float32 (4 bytes per parameter)
-            size_bytes = total_params * 4
-            return size_bytes / (1024 * 1024)  # Convert to MB
-        else:
-            return 0.0
-    except:
-        return 0.0
-
-def test_model_functionality(model, tokenizer):
-    """Test if the quantized model still works."""
-    try:
-        # Create test input
-        test_text = "Hello, this is a test sentence."
-        inputs = tokenizer(test_text, return_tensors="pt")
-        
-        # Run inference
-        with torch.no_grad():
-            outputs = model(**inputs)
-        
-        logger.info("  ✓ Model inference successful")
-        
-        # Check output shape
-        if hasattr(outputs, 'last_hidden_state'):
-            hidden_states = outputs.last_hidden_state
-            logger.info(f"  ✓ Output shape: {hidden_states.shape}")
-        
-    except Exception as e:
-        logger.error(f"  ✗ Model functionality test failed: {e}")
 
 if __name__ == "__main__":
-    # Import torch here to avoid import errors
-    import torch
     main()

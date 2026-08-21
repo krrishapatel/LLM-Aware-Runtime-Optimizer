@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.onnx
+*.tar.gz
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.venv/
+deployment_package/

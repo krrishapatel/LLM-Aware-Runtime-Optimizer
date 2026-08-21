@@ -1,0 +1,16 @@
+# Development and test dependencies.
+-r requirements.txt
+
+pytest>=7.0.0
+
+# The ONNX tests use importorskip, so without these they skip silently and prove
+# nothing. CI installs this file so they actually run.
+onnx>=1.14.0
+onnxruntime>=1.15.0
+# torch 2.13's torch.onnx.export defaults to the dynamo exporter, which needs
+# onnxscript. Without it the export raises ModuleNotFoundError.
+onnxscript>=0.1.0
+
+# Optional at runtime: utils reports memory as None when it is missing. Installed
+# here so the memory branch of get_system_info() is covered.
+psutil>=5.9.0

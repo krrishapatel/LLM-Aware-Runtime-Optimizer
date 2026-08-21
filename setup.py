@@ -1,83 +1,74 @@
 #!/usr/bin/env python3
+"""Setup script.
+
+The previous version could not install. It read requirements from
+`requirements_minimal.txt`, which does not exist, and used
+`find_packages(where="src")` with `package_dir={"": "src"}` in a repo that has no
+src/ directory, so it found no packages.
 """
-Setup script for LLM-Aware Runtime Optimizer
-"""
 
-from setuptools import setup, find_packages
-import os
+from pathlib import Path
 
-# Read the README file
-def read_readme():
-    with open("README.md", "r", encoding="utf-8") as fh:
-        return fh.read()
+from setuptools import find_packages, setup
 
-# Read requirements
-def read_requirements():
-    with open("requirements_minimal.txt", "r", encoding="utf-8") as fh:
-        return [line.strip() for line in fh if line.strip() and not line.startswith("#")]
+ROOT = Path(__file__).parent
+
+# The runtime dependencies, kept here as the single source of truth so
+# `pip install -e .` and `pip install -r requirements.txt` cannot drift apart.
+INSTALL_REQUIRES = [
+    "torch>=2.0.0",
+    "transformers>=4.30.0",
+]
 
 setup(
     name="llm-runtime-optimizer",
-    version="0.1.0",
-    author="LLM Optimizer Team",
-    author_email="support@llm-optimizer.com",
-    description="MLIR-based runtime optimizer for quantized transformer LLMs",
-    long_description=read_readme(),
+    version="0.2.0",
+    author="Krrisha Patel",
+    description="Quantize a PyTorch transformer and measure whether it got faster",
+    long_description=(ROOT / "README.md").read_text(encoding="utf-8"),
     long_description_content_type="text/markdown",
-    url="https://github.com/llm-optimizer/llm-runtime-optimizer",
+    url="https://github.com/krrishapatel/LLM-Aware-Runtime-Optimizer",
     project_urls={
-        "Bug Reports": "https://github.com/llm-optimizer/llm-runtime-optimizer/issues",
-        "Source": "https://github.com/llm-optimizer/llm-runtime-optimizer",
-        "Documentation": "https://llm-optimizer.readthedocs.io/",
+        "Source": "https://github.com/krrishapatel/LLM-Aware-Runtime-Optimizer",
+        "Issues": (
+            "https://github.com/krrishapatel/LLM-Aware-Runtime-Optimizer/issues"
+        ),
     },
-    packages=find_packages(where="src"),
-    package_dir={"": "src"},
+    license="MIT",
+    packages=find_packages(include=["llm_optimizer", "llm_optimizer.*"]),
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Developers",
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
-        "Programming Language :: Python :: 3.13",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
-        "Topic :: Software Development :: Libraries :: Python Modules",
     ],
-    python_requires=">=3.8",
-    install_requires=read_requirements(),
+    # 3.9 is the floor because the type hints use the typing module rather than
+    # builtin generics, and dataclasses need 3.7 at minimum.
+    python_requires=">=3.9",
+    install_requires=INSTALL_REQUIRES,
     extras_require={
+        # ONNX export and graph optimization. Optional: llm_optimizer imports
+        # onnx inside the functions that need it, not at module level.
+        "onnx": ["onnx>=1.14.0", "onnxruntime>=1.15.0", "onnxscript>=0.1.0"],
         "dev": [
             "pytest>=7.0.0",
-            "pytest-cov>=4.0.0",
-            "pytest-benchmark>=4.0.0",
-            "black>=22.0.0",
-            "isort>=5.10.0",
-            "flake8>=5.0.0",
-            "mypy>=0.991",
-            "pre-commit>=2.20.0",
-        ],
-        "docs": [
-            "sphinx>=5.0.0",
-            "sphinx-rtd-theme>=1.0.0",
-            "myst-parser>=0.17.0",
-        ],
-        "examples": [
-            "jupyter>=1.0.0",
-            "ipykernel>=6.15.0",
-            "notebook>=6.5.0",
+            "onnx>=1.14.0",
+            "onnxruntime>=1.15.0",
+            "onnxscript>=0.1.0",
+            "psutil>=5.9.0",
         ],
     },
     entry_points={
         "console_scripts": [
             "llm-optimize=llm_optimizer.cli:main",
-            "llm-benchmark=llm_optimizer.cli:main",
         ],
     },
-    include_package_data=True,
     zip_safe=False,
-    keywords="mlir, llm, transformer, optimization, quantization, tensorrt, cuda",
+    keywords="pytorch quantization transformer benchmarking onnx sagemaker",
 )

@@ -1,198 +1,186 @@
 #!/usr/bin/env python3
+"""Command line interface.
+
+Every subcommand does what it says. The old CLI had `deploy` and `benchmark`
+subcommands whose bodies printed "not implemented in this version", and an
+`info` command whose environment check was `if validate_environment():` against
+a function that always returned a non-empty dict.
 """
-Command-line interface for LLM-Aware Runtime Optimizer.
-"""
+
 import argparse
+import json
 import logging
 import sys
-from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from .core import LLMOptimizer
-from .utils import setup_logging, validate_environment, get_system_info
+from .utils import get_system_info, setup_logging, validate_environment
 
-def main():
-    """Main CLI entry point."""
-    parser = create_argument_parser()
-    args = parser.parse_args()
-    
-    # Setup logging
-    setup_logging(level=args.log_level, log_file=args.log_file)
-    
-    try:
-        if args.command == "info":
-            show_info()
-        elif args.command == "optimize":
-            run_optimization(args)
-        elif args.command == "analyze":
-            analyze_model(args)
-        elif args.command == "deploy":
-            deploy_model(args)
-        elif args.command == "benchmark":
-            run_benchmark(args)
-        else:
-            parser.print_help()
-            
-    except Exception as e:
-        logging.error(f"Command failed: {e}")
-        sys.exit(1)
+logger = logging.getLogger(__name__)
+
+EXIT_OK = 0
+EXIT_FAILED = 1
+
 
 def create_argument_parser() -> argparse.ArgumentParser:
-    """Create the argument parser."""
     parser = argparse.ArgumentParser(
-        description="LLM-Aware Runtime Optimizer CLI",
+        prog="llm-optimize",
+        description="Quantize a transformer and measure the result.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  llm-optimize info                    # Show system information
-  llm-optimize optimize gpt2           # Optimize GPT-2 model
-  llm-optimize analyze bert-base       # Analyze BERT model
-        """
+        epilog=(
+            "Examples:\n"
+            "  llm-optimize info\n"
+            "  llm-optimize analyze prajjwal1/bert-tiny\n"
+            "  llm-optimize optimize prajjwal1/bert-tiny --seq-len 32 --runs 30\n"
+        ),
     )
-    
-    # Global arguments
     parser.add_argument(
         "--log-level",
-        default="INFO",
+        default="WARNING",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level (default: INFO)"
+        help="Logging level (default: WARNING)",
     )
-    parser.add_argument(
-        "--log-file",
-        help="Log file path (optional)"
+    parser.add_argument("--log-file", help="Also write logs to this file")
+
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.add_parser("info", help="Show system and environment information")
+
+    analyze_parser = subparsers.add_parser(
+        "analyze", help="Count a model's layers and print quantization suggestions"
     )
-    
-    # Subcommands
-    subparsers = parser.add_subparsers(dest="command", help="Available commands")
-    
-    # Info command
-    info_parser = subparsers.add_parser("info", help="Show system information")
-    
-    # Optimize command
-    optimize_parser = subparsers.add_parser("optimize", help="Optimize a model")
-    optimize_parser.add_argument("model_name", help="Model name or path")
-    optimize_parser.add_argument("--device", default="cpu", help="Target device (default: cpu)")
-    optimize_parser.add_argument("--level", default="balanced", 
-                               choices=["conservative", "balanced", "aggressive"],
-                               help="Optimization level (default: balanced)")
-    optimize_parser.add_argument("--output", help="Output directory for optimized model")
-    
-    # Analyze command
-    analyze_parser = subparsers.add_parser("analyze", help="Analyze a model")
-    analyze_parser.add_argument("model_name", help="Model name or path")
-    
-    # Deploy command
-    deploy_parser = subparsers.add_parser("deploy", help="Deploy a model")
-    deploy_parser.add_argument("model_path", help="Path to optimized model")
-    deploy_parser.add_argument("--platform", default="local", help="Deployment platform")
-    
-    # Benchmark command
-    benchmark_parser = subparsers.add_parser("benchmark", help="Benchmark model performance")
-    benchmark_parser.add_argument("model_path", help="Path to model")
-    benchmark_parser.add_argument("--runs", type=int, default=100, help="Number of benchmark runs")
-    
+    analyze_parser.add_argument("model_name", help="HuggingFace model name or path")
+
+    optimize_parser = subparsers.add_parser(
+        "optimize", help="Quantize a model, benchmark it, and report measured numbers"
+    )
+    optimize_parser.add_argument("model_name", help="HuggingFace model name or path")
+    optimize_parser.add_argument(
+        "--quantization",
+        default="dynamic",
+        choices=["dynamic", "fp16"],
+        help="Quantization mode (default: dynamic). Static needs calibration "
+        "data and is only available through the Python API.",
+    )
+    optimize_parser.add_argument(
+        "--seq-len", type=int, default=32, help="Sequence length for the benchmark input"
+    )
+    optimize_parser.add_argument(
+        "--runs", type=int, default=30, help="Timed runs per model (default: 30)"
+    )
+    optimize_parser.add_argument("--output", help="Directory to save the result in")
+
     return parser
 
-def show_info():
-    """Show system information."""
-    print("🚀 LLM-Aware Runtime Optimizer")
-    print("=" * 50)
-    
-    # Environment validation
-    print("\n📋 Environment Validation:")
-    if validate_environment():
-        print("✅ Environment is ready for LLM optimization")
+
+def show_info() -> int:
+    result = validate_environment()
+
+    print("Environment")
+    print("-" * 40)
+    print("ready:", "yes" if result["ready"] else "no")
+    for problem in result["problems"]:
+        print("  problem:", problem)
+    for warning in result["warnings"]:
+        print("  warning:", warning)
+
+    print("\nSystem")
+    print("-" * 40)
+    for key, value in get_system_info().items():
+        if key in ("memory_total", "memory_available") and value is not None:
+            value = f"{value / 1024**3:.1f} GB"
+        print(f"  {key}: {value}")
+
+    return EXIT_OK if result["ready"] else EXIT_FAILED
+
+
+def analyze_model(args) -> int:
+    optimizer = LLMOptimizer(model_name=args.model_name).load_model()
+    result = optimizer.analyze()
+
+    print(f"Analysis of {args.model_name}")
+    print("-" * 40)
+    for key, value in result["counts"].items():
+        if isinstance(value, float):
+            print(f"  {key}: {value:.3f}")
+        else:
+            print(f"  {key}: {value:,}" if isinstance(value, int) else f"  {key}: {value}")
+
+    print("\nSuggestions")
+    print("-" * 40)
+    for note in result["suggestions"]:
+        print(f"  - {note}")
+
+    return EXIT_OK
+
+
+def run_optimization(args) -> int:
+    import torch
+
+    optimizer = LLMOptimizer(
+        model_name=args.model_name,
+        quantization=args.quantization,
+        target_device="cpu",
+    ).load_model()
+
+    optimizer.optimize()
+    quantization = optimizer.quantization_report
+    print(f"Quantization ({quantization['quantization_type']})")
+    print("-" * 40)
+    print(f"  size before: {quantization['size_bytes_before'] / 1024**2:.2f} MB")
+    print(f"  size after:  {quantization['size_bytes_after'] / 1024**2:.2f} MB")
+    print(f"  reduction:   {quantization['size_reduction']:.1%}")
+    print(f"  converted modules: {quantization['converted_modules']}")
+
+    vocab_size = getattr(optimizer.model.config, "vocab_size", 1000)
+    example = torch.randint(0, vocab_size, (1, args.seq_len), dtype=torch.long)
+    result = optimizer.benchmark(example, num_runs=args.runs)
+
+    print(f"\nLatency over {args.runs} runs, batch 1 x {args.seq_len} tokens")
+    print("-" * 40)
+    print(
+        f"  original:  {result['baseline']['median_ms']:.2f} ms median "
+        f"(stdev {result['baseline']['stdev_ms']:.2f})"
+    )
+    print(
+        f"  quantized: {result['candidate']['median_ms']:.2f} ms median "
+        f"(stdev {result['candidate']['stdev_ms']:.2f})"
+    )
+    print(f"  speedup:   {result['speedup']:.2f}x")
+    if not result["significant"]:
+        print("  the difference is inside the run-to-run noise, so treat it as no change")
+
+    if args.output:
+        saved = optimizer.save(args.output)
+        print(f"\nSaved to {saved}")
     else:
-        print("❌ Environment has issues")
-    
-    # System information
-    print("\n💻 System Information:")
-    try:
-        sys_info = get_system_info()
-        for key, value in sys_info.items():
-            if key == "memory_total" or key == "memory_available":
-                value = f"{value / (1024**3):.1f} GB"
-            print(f"  {key.replace('_', ' ').title()}: {value}")
-    except Exception as e:
-        print(f"  ❌ Could not get system info: {e}")
-    
-    # Package information
-    print("\n📦 Package Information:")
-    try:
-        import llm_optimizer
-        print(f"  Version: {llm_optimizer.__version__}")
-        print(f"  Author: {llm_optimizer.__author__}")
-    except Exception as e:
-        print(f"  ❌ Could not get package info: {e}")
+        print("\n" + json.dumps(optimizer.report()["quantization_report"], indent=2))
 
-def run_optimization(args):
-    """Run model optimization."""
-    print(f"🚀 Starting optimization of {args.model_name}")
-    
+    return EXIT_OK
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = create_argument_parser()
+    args = parser.parse_args(argv)
+
+    if args.command is None:
+        parser.print_help()
+        return EXIT_OK
+
+    setup_logging(level=args.log_level, log_file=args.log_file)
+
+    handlers = {
+        "info": lambda: show_info(),
+        "analyze": lambda: analyze_model(args),
+        "optimize": lambda: run_optimization(args),
+    }
     try:
-        optimizer = LLMOptimizer(
-            model_name=args.model_name,
-            target_device=args.device,
-            optimization_level=args.level
-        )
-        
-        print("📥 Loading model...")
-        optimizer.load_model()
-        
-        print("⚡ Running optimization...")
-        optimized_model = optimizer.optimize()
-        
-        if args.output:
-            print(f"💾 Saving optimized model to {args.output}...")
-            output_path = optimizer.save_optimized_model(args.output)
-            print(f"✅ Model saved to: {output_path}")
-        
-        # Show optimization report
-        report = optimizer.get_optimization_report()
-        print("\n📊 Optimization Report:")
-        for key, value in report.items():
-            print(f"  {key.replace('_', ' ').title()}: {value}")
-            
-    except Exception as e:
-        print(f"❌ Optimization failed: {e}")
-        raise
+        return handlers[args.command]()
+    except (ImportError, ValueError, KeyError, OSError) as e:
+        # Narrow, so a bug in the pipeline still shows its traceback instead of
+        # being flattened into a one-line error message.
+        print(f"error: {e}", file=sys.stderr)
+        return EXIT_FAILED
 
-def analyze_model(args):
-    """Analyze a model."""
-    print(f"🔍 Analyzing model: {args.model_name}")
-    
-    try:
-        optimizer = LLMOptimizer(
-            model_name=args.model_name,
-            target_device="cpu"
-        )
-        
-        print("📥 Loading model...")
-        optimizer.load_model()
-        
-        # Basic model analysis
-        if hasattr(optimizer.model, 'parameters'):
-            total_params = sum(p.numel() for p in optimizer.model.parameters())
-            print(f"📊 Total parameters: {total_params:,}")
-            print(f"📊 Estimated model size: {total_params * 4 / (1024**2):.1f} MB")
-        
-        print("✅ Model analysis completed")
-        
-    except Exception as e:
-        print(f"❌ Analysis failed: {e}")
-        raise
-
-def deploy_model(args):
-    """Deploy a model."""
-    print(f"🚀 Deploying model from: {args.model_path}")
-    print("⚠️  Deployment functionality not implemented in this version")
-    print("   This is a placeholder for future implementation")
-
-def run_benchmark(args):
-    """Run model benchmarking."""
-    print(f"⚡ Benchmarking model: {args.model_path}")
-    print("⚠️  Benchmarking functionality not implemented in this version")
-    print("   This is a placeholder for future implementation")
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
