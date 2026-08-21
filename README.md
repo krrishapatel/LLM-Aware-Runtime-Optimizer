@@ -110,11 +110,13 @@ than assumed away: a quantized model reporting 0 bytes because
 double-counted those same `_packed_params` children, and an assumption that graph
 optimization always reduces the ONNX node count.
 
-That last one is worth a note. On a small transformer, onnxruntime at level
-`extended` takes the graph from 25 nodes to 28 while doing genuine fusion: it
-folds nine Adds and nine MatMuls into seven Gemms, then inserts fourteen Reshapes
-to give those Gemms 2D inputs. Node count is not a quality metric. Read
-`ops_added` and `ops_removed` instead.
+That last one is worth a note. On the same small transformer at level
+`extended`, onnxruntime 1.29 takes the graph from 25 nodes to 28 while doing
+genuine fusion: it folds nine Adds and nine MatMuls into seven Gemms, then
+inserts fourteen Reshapes to give those Gemms 2D inputs. onnxruntime 1.19 goes
+the other way, 30 nodes to 21, fusing into the contrib op `FusedMatMul` instead.
+Both are correctly optimized graphs. Node count is not a quality metric, and
+neither is the name of the fused operator, which is why CI runs both versions.
 
 ## SageMaker packaging
 

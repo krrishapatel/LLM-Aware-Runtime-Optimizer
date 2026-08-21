@@ -110,6 +110,11 @@ class TestOptimize:
     def test_real_fusion_shows_up_as_new_operator_types(
         self, tiny_lm, tiny_lm_input, tmp_path
     ):
+        # The matmuls get folded into a single fused operator, but which one
+        # depends on the onnxruntime version. CI measured both: 1.29 produces
+        # Gemm, 1.19 produces the contrib op FusedMatMul. Asserting the exact
+        # name passed locally and failed on the older runtime, so the assertion
+        # is on the shape of the change rather than the operator's spelling.
         pytest.importorskip("onnxruntime", reason="onnxruntime is optional")
 
         source = onnx_export.export(tiny_lm, tiny_lm_input, str(tmp_path / "lm2.onnx"))
@@ -117,21 +122,26 @@ class TestOptimize:
             source, str(tmp_path / "lm2_opt.onnx"), level="extended"
         )
 
-        # MatMul+Add folded into Gemm, and the layer norms into
-        # SkipLayerNormalization. These are fused operator types that did not
-        # exist in the exported graph.
-        assert "Gemm" in change["ops_added"]
-        assert "SkipLayerNormalization" in change["ops_added"]
-        assert "Add" in change["ops_removed"]
+        assert change["ops_added"], "no new operator types, so nothing was fused"
+        assert change["ops_removed"], "no operator types disappeared"
+        assert any(
+            "MatMul" in op or "Gemm" in op for op in change["ops_added"]
+        ), f"the matmuls were not fused into anything: {change['ops_added']}"
 
-    def test_the_node_count_can_go_up_while_fusion_happens(
+    def test_the_node_count_direction_is_not_predictable(
         self, tiny_lm, tiny_lm_input, tmp_path
     ):
-        # Measured, and the reason nodes_removed is not the success metric. On
-        # this model onnxruntime folds nine Adds and nine MatMuls into seven
-        # Gemms, then inserts fourteen Reshapes to give the Gemms 2D inputs, so
-        # the total goes from 25 nodes to 28. A test asserting the count never
-        # rises would have failed against a correctly optimized graph.
+        # Why nodes_removed is not the success metric. Both directions were
+        # measured on the same model and the same input:
+        #
+        #   onnxruntime 1.29: 25 -> 28 nodes. Nine Adds and nine MatMuls fold
+        #     into seven Gemms, then fourteen Reshapes are inserted to give
+        #     those Gemms 2D inputs, so the total rises.
+        #   onnxruntime 1.19: 30 -> 21 nodes.
+        #
+        # A test asserting either direction is asserting a runtime version. So
+        # this checks the arithmetic holds and that something changed, and the
+        # caller is told to read ops_added instead.
         pytest.importorskip("onnxruntime", reason="onnxruntime is optional")
 
         source = onnx_export.export(tiny_lm, tiny_lm_input, str(tmp_path / "lm3.onnx"))
@@ -139,13 +149,18 @@ class TestOptimize:
             source, str(tmp_path / "lm3_opt.onnx"), level="extended"
         )
 
-        assert change["nodes_after"] > change["nodes_before"]
-        assert change["nodes_removed"] < 0
-        assert "Reshape" in change["ops_added"]
+        assert change["nodes_removed"] == (
+            change["nodes_before"] - change["nodes_after"]
+        )
+        assert change["nodes_after"] != change["nodes_before"]
 
-    def test_disabling_optimization_changes_nothing(
+    def test_disabling_optimization_fuses_nothing(
         self, tiny_lm, tiny_lm_input, tmp_path
     ):
+        # Not "changes nothing": onnxruntime 1.19 at ORT_DISABLE_ALL still adds a
+        # Constant node while converting the ONNX graph to its own format, so an
+        # equality assertion here fails on that version. What the level actually
+        # promises is that no fusion happens, which is what gets checked.
         pytest.importorskip("onnxruntime", reason="onnxruntime is optional")
 
         source = onnx_export.export(tiny_lm, tiny_lm_input, str(tmp_path / "lm4.onnx"))
@@ -153,5 +168,10 @@ class TestOptimize:
             source, str(tmp_path / "lm4_opt.onnx"), level="disable"
         )
 
-        assert change["ops_added"] == []
+        fused = [
+            op
+            for op in change["ops_added"]
+            if "Fused" in op or "Gemm" in op or "SkipLayerNorm" in op
+        ]
+        assert fused == [], f"fusion happened with optimization disabled: {fused}"
         assert change["ops_removed"] == []

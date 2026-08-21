@@ -110,11 +110,17 @@ def optimize_with_onnxruntime(
 
     Returns the output path and a dict describing the difference. Read
     `ops_added` and `ops_removed`, not `nodes_removed`: a node count can go up
-    while real fusion happens. On a small transformer at level 'extended',
-    onnxruntime folds MatMul+Add into Gemm and the layer norms into
-    SkipLayerNormalization, then inserts Reshape nodes around the Gemms, so the
-    graph goes from 25 nodes to 28 and is still the better graph. Node count is
-    not a quality metric.
+    while real fusion happens, and the direction is not even stable across
+    onnxruntime versions. Measured on the same small transformer at level
+    'extended':
+
+      1.29: 25 -> 28 nodes. MatMul+Add folds into Gemm and the layer norms into
+            SkipLayerNormalization, then fourteen Reshapes are inserted to give
+            the Gemms 2D inputs.
+      1.19: 30 -> 21 nodes, fusing the matmuls into the contrib op FusedMatMul.
+
+    Both are correctly optimized graphs. Node count is not a quality metric, and
+    neither is the name of the fused operator.
     """
     if level not in GRAPH_OPTIMIZATION_LEVELS:
         raise ValueError(
