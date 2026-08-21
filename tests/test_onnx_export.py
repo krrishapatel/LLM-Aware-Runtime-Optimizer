@@ -157,21 +157,28 @@ class TestOptimize:
     def test_disabling_optimization_fuses_nothing(
         self, tiny_lm, tiny_lm_input, tmp_path
     ):
-        # Not "changes nothing": onnxruntime 1.19 at ORT_DISABLE_ALL still adds a
-        # Constant node while converting the ONNX graph to its own format, so an
-        # equality assertion here fails on that version. What the level actually
-        # promises is that no fusion happens, which is what gets checked.
+        # Not "changes nothing". ORT_DISABLE_ALL turns off the optimizer, not the
+        # conversion into onnxruntime's internal format, and 1.19 drops the
+        # graph's Constant nodes during that conversion. Two equality assertions
+        # here failed on that version for that reason.
+        #
+        # What the level promises is that no fusion happens, so the test compares
+        # the two levels on the same graph: disable adds no fused operator,
+        # extended does.
         pytest.importorskip("onnxruntime", reason="onnxruntime is optional")
 
-        source = onnx_export.export(tiny_lm, tiny_lm_input, str(tmp_path / "lm4.onnx"))
-        _, change = onnx_export.optimize_with_onnxruntime(
-            source, str(tmp_path / "lm4_opt.onnx"), level="disable"
-        )
+        def fused_ops(level):
+            source = onnx_export.export(
+                tiny_lm, tiny_lm_input, str(tmp_path / f"lm4_{level}.onnx")
+            )
+            _, change = onnx_export.optimize_with_onnxruntime(
+                source, str(tmp_path / f"lm4_{level}_opt.onnx"), level=level
+            )
+            return [
+                op
+                for op in change["ops_added"]
+                if "Fused" in op or "Gemm" in op or "SkipLayerNorm" in op
+            ]
 
-        fused = [
-            op
-            for op in change["ops_added"]
-            if "Fused" in op or "Gemm" in op or "SkipLayerNorm" in op
-        ]
-        assert fused == [], f"fusion happened with optimization disabled: {fused}"
-        assert change["ops_removed"] == []
+        assert fused_ops("disable") == []
+        assert fused_ops("extended") != []
